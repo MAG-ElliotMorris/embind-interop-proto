@@ -1,0 +1,273 @@
+/*
+ * Copyright 2023 Magnopus LLC
+
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "../SpaceSystemTestHelpers.h"
+#include "../UserSystemTestHelpers.h"
+#include "Awaitable.h"
+#include "CSP/CSPFoundation.h"
+#include "CSP/Common/Optional.h"
+#include "CSP/Multiplayer/Components/ScriptSpaceComponent.h"
+#include "CSP/Multiplayer/Components/VideoPlayerSpaceComponent.h"
+#include "CSP/Multiplayer/MultiPlayerConnection.h"
+#include "CSP/Multiplayer/SpaceEntity.h"
+#include "CSP/Systems/SystemsManager.h"
+#include "CSP/Systems/Users/UserSystem.h"
+#include "TestHelpers.h"
+
+#include "gtest/gtest.h"
+#include <chrono>
+#include <thread>
+
+using namespace csp::multiplayer;
+using namespace std::chrono_literals;
+
+namespace
+{
+
+bool RequestPredicate(const csp::systems::ResultBase& Result) { return Result.GetResultCode() != csp::systems::EResultCode::InProgress; }
+
+} // namespace
+
+CSP_PUBLIC_TEST(CSPEngine, VideoTests, VideoPlayerComponentTest)
+{
+    SetRandSeed();
+
+    auto& SystemsManager = csp::systems::SystemsManager::Get();
+    auto* UserSystem = SystemsManager.GetUserSystem();
+    auto* SpaceSystem = SystemsManager.GetSpaceSystem();
+
+    // Log in
+    csp::common::String UserId;
+    LogInAsNewTestUser(UserSystem, UserId);
+
+    // Create space
+    csp::systems::Space Space;
+    CreateDefaultTestSpace(SpaceSystem, Space);
+
+    std::unique_ptr<csp::multiplayer::OnlineRealtimeEngine> RealtimeEngine { SystemsManager.MakeOnlineRealtimeEngine() };
+    RealtimeEngine->SetEntityFetchCompleteCallback([](uint32_t) {});
+
+    auto [EnterResult] = AWAIT_PRE(SpaceSystem, EnterSpace, RequestPredicate, Space.Id, RealtimeEngine.get());
+
+    EXPECT_EQ(EnterResult.GetResultCode(), csp::systems::EResultCode::Success);
+
+    RealtimeEngine->SetRemoteEntityCreatedCallback([](csp::multiplayer::SpaceEntity* /*Entity*/) {});
+
+    // Create parent entity
+    csp::common::String ObjectName = "Object 1";
+    SpaceTransform ObjectTransform = { csp::common::Vector3::Zero(), csp::common::Vector4::Zero(), csp::common::Vector3::One() };
+    auto [CreatedObject] = AWAIT(RealtimeEngine.get(), CreateEntity, ObjectName, ObjectTransform, csp::common::Optional<uint64_t> {});
+
+    // Create video player component
+    auto* VideoComponent = static_cast<VideoPlayerSpaceComponent*>(CreatedObject->AddComponent(ComponentType::VideoPlayer));
+
+    // Ensure defaults are set
+    EXPECT_EQ(VideoComponent->GetPosition(), csp::common::Vector3::Zero());
+    EXPECT_EQ(VideoComponent->GetPlaybackState(), VideoPlayerPlaybackState::Reset);
+    EXPECT_EQ(VideoComponent->GetVideoAssetURL(), "");
+    EXPECT_EQ(VideoComponent->GetAssetCollectionId(), "");
+    EXPECT_EQ(VideoComponent->GetAttenuationRadius(), 10.f);
+    EXPECT_EQ(VideoComponent->GetIsLoopPlayback(), false);
+    EXPECT_EQ(VideoComponent->GetTimeSincePlay(), 0.f);
+    EXPECT_EQ(VideoComponent->GetIsStateShared(), false);
+    EXPECT_EQ(VideoComponent->GetIsAutoPlay(), false);
+    EXPECT_EQ(VideoComponent->GetIsAutoResize(), false);
+    EXPECT_EQ(VideoComponent->GetCurrentPlayheadPosition(), 0.0f);
+    EXPECT_EQ(VideoComponent->GetVideoPlayerSourceType(), VideoPlayerSourceType::AssetSource);
+    EXPECT_EQ(VideoComponent->GetStereoVideoType(), StereoVideoType::None);
+    EXPECT_EQ(VideoComponent->GetIsVisible(), true);
+    EXPECT_EQ(VideoComponent->GetIsARVisible(), true);
+    EXPECT_EQ(VideoComponent->GetIsVirtualVisible(), true);
+    EXPECT_EQ(VideoComponent->GetIsEnabled(), true);
+    EXPECT_EQ(VideoComponent->GetIsStereoFlipped(), false);
+
+    CreatedObject->QueueUpdate();
+    RealtimeEngine->ProcessPendingEntityOperations();
+
+    // Set new values
+    csp::common::String AssetId = "TEST_ASSET_ID";
+    csp::common::String AssetCollectionId = "TEST_COLLECTION_ID";
+
+    VideoComponent->SetPosition(csp::common::Vector3::One());
+    VideoComponent->SetPlaybackState(VideoPlayerPlaybackState::Play);
+    VideoComponent->SetVideoAssetURL("http://youtube.com/avideo");
+    VideoComponent->SetAssetCollectionId(AssetId);
+    VideoComponent->SetAttenuationRadius(100.f);
+    VideoComponent->SetIsLoopPlayback(true);
+    VideoComponent->SetTimeSincePlay(1.f);
+    VideoComponent->SetIsStateShared(true);
+    VideoComponent->SetIsAutoPlay(true);
+    VideoComponent->SetIsAutoResize(true);
+    VideoComponent->SetCurrentPlayheadPosition(1.0f);
+    VideoComponent->SetVideoPlayerSourceType(VideoPlayerSourceType::URLSource);
+    VideoComponent->SetStereoVideoType(StereoVideoType::SideBySide);
+    VideoComponent->SetIsVisible(false);
+    VideoComponent->SetIsARVisible(false);
+    VideoComponent->SetIsVirtualVisible(false);
+    VideoComponent->SetIsEnabled(false);
+    VideoComponent->SetIsStereoFlipped(true);
+
+    // Ensure values are set correctly
+    EXPECT_EQ(VideoComponent->GetPosition(), csp::common::Vector3::One());
+    EXPECT_EQ(VideoComponent->GetPlaybackState(), VideoPlayerPlaybackState::Play);
+    EXPECT_EQ(VideoComponent->GetVideoAssetURL(), "http://youtube.com/avideo");
+    EXPECT_EQ(VideoComponent->GetAssetCollectionId(), AssetId);
+    EXPECT_EQ(VideoComponent->GetAttenuationRadius(), 100.f);
+    EXPECT_EQ(VideoComponent->GetIsLoopPlayback(), true);
+    EXPECT_EQ(VideoComponent->GetTimeSincePlay(), 1.f);
+    EXPECT_EQ(VideoComponent->GetIsStateShared(), true);
+    EXPECT_EQ(VideoComponent->GetIsAutoPlay(), true);
+    EXPECT_EQ(VideoComponent->GetIsAutoResize(), true);
+    EXPECT_EQ(VideoComponent->GetCurrentPlayheadPosition(), 1.0f);
+    EXPECT_EQ(VideoComponent->GetVideoPlayerSourceType(), VideoPlayerSourceType::URLSource);
+    EXPECT_EQ(VideoComponent->GetStereoVideoType(), StereoVideoType::SideBySide);
+    EXPECT_EQ(VideoComponent->GetIsVisible(), false);
+    EXPECT_EQ(VideoComponent->GetIsARVisible(), false);
+    EXPECT_EQ(VideoComponent->GetIsVirtualVisible(), false);
+    EXPECT_EQ(VideoComponent->GetIsEnabled(), false);
+    EXPECT_EQ(VideoComponent->GetIsStereoFlipped(), true);
+
+    auto [ExitSpaceResult] = AWAIT_PRE(SpaceSystem, ExitSpace, RequestPredicate);
+
+    // Delete space
+    DeleteSpace(SpaceSystem, Space.Id);
+
+    // Log out
+    LogOut(UserSystem);
+}
+
+CSP_PUBLIC_TEST(CSPEngine, VideoTests, VideoPlayerScriptInterfaceTest)
+{
+    SetRandSeed();
+
+    auto& SystemsManager = csp::systems::SystemsManager::Get();
+    auto* UserSystem = SystemsManager.GetUserSystem();
+    auto* SpaceSystem = SystemsManager.GetSpaceSystem();
+
+    // Log in
+    csp::common::String UserId;
+    LogInAsNewTestUser(UserSystem, UserId);
+
+    // Create space
+    csp::systems::Space Space;
+    CreateDefaultTestSpace(SpaceSystem, Space);
+
+    std::unique_ptr<csp::multiplayer::OnlineRealtimeEngine> RealtimeEngine { SystemsManager.MakeOnlineRealtimeEngine() };
+    RealtimeEngine->SetEntityFetchCompleteCallback([](uint32_t) {});
+
+    auto [EnterResult] = AWAIT_PRE(SpaceSystem, EnterSpace, RequestPredicate, Space.Id, RealtimeEngine.get());
+
+    EXPECT_EQ(EnterResult.GetResultCode(), csp::systems::EResultCode::Success);
+
+    RealtimeEngine->SetRemoteEntityCreatedCallback([](csp::multiplayer::SpaceEntity* /*Entity*/) {});
+
+    // Create parent entity
+    csp::common::String ObjectName = "Object 1";
+    SpaceTransform ObjectTransform = { csp::common::Vector3::Zero(), csp::common::Vector4::Zero(), csp::common::Vector3::One() };
+    auto [CreatedObject] = AWAIT(RealtimeEngine.get(), CreateEntity, ObjectName, ObjectTransform, csp::common::Optional<uint64_t> {});
+
+    // Create video player component
+    auto* VideoPlayerComponent = (VideoPlayerSpaceComponent*)CreatedObject->AddComponent(ComponentType::VideoPlayer);
+
+    // Create script component
+    auto* ScriptComponent = (ScriptSpaceComponent*)CreatedObject->AddComponent(ComponentType::ScriptData);
+
+    CreatedObject->QueueUpdate();
+    RealtimeEngine->ProcessPendingEntityOperations();
+
+    EXPECT_EQ(VideoPlayerComponent->GetPosition(), csp::common::Vector3::Zero());
+    EXPECT_EQ(VideoPlayerComponent->GetScale(), csp::common::Vector3::One());
+    EXPECT_EQ(VideoPlayerComponent->GetRotation(), csp::common::Vector4::Identity());
+    EXPECT_EQ(VideoPlayerComponent->GetVideoAssetId(), "");
+    EXPECT_EQ(VideoPlayerComponent->GetVideoAssetURL(), "");
+    EXPECT_EQ(VideoPlayerComponent->GetAssetCollectionId(), "");
+    EXPECT_EQ(VideoPlayerComponent->GetIsStateShared(), false);
+    EXPECT_EQ(VideoPlayerComponent->GetIsLoopPlayback(), false);
+    EXPECT_EQ(VideoPlayerComponent->GetIsAutoResize(), false);
+    EXPECT_EQ(VideoPlayerComponent->GetPlaybackState(), VideoPlayerPlaybackState::Reset);
+    EXPECT_EQ(VideoPlayerComponent->GetCurrentPlayheadPosition(), 0.0f);
+    EXPECT_EQ(VideoPlayerComponent->GetTimeSincePlay(), 0.f);
+    EXPECT_EQ(VideoPlayerComponent->GetVideoPlayerSourceType(), VideoPlayerSourceType::AssetSource);
+    EXPECT_EQ(VideoPlayerComponent->GetStereoVideoType(), StereoVideoType::None);
+    EXPECT_EQ(VideoPlayerComponent->GetIsVisible(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsARVisible(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsVirtualVisible(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsEnabled(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsStereoFlipped(), false);
+
+    // Setup script
+    const std::string VideoPlayerScriptText = R"xx(
+
+		var video = ThisEntity.getVideoPlayerComponents()[0];
+
+        video.position = [1, 1, 1];
+        video.scale = [2, 2, 2];
+		video.rotation = [1, 1, 1, 1];
+        video.videoAssetId = "TestVideoAssetId";
+        video.videoAssetURL = "http://youtube.com/avideo"
+        video.assetCollectionId = "TestAssetCollectionId"
+        video.isStateShared = true;
+        video.isLoopPlayback = true;
+        video.isAutoResize = true;
+        video.playbackState = 2;
+        video.currentPlayheadPosition = 1;
+        video.timeSincePlay = 1;
+        video.videoPlayerSourceType = 0;
+        video.stereoVideoType = 1;
+        video.isStereoFlipped = true;
+		video.isVisible = false;
+        video.isARVisible = false;
+        video.isVirtualVisible = false;
+        video.isEnabled = false;
+
+    )xx";
+
+    ScriptComponent->SetScriptSource(VideoPlayerScriptText.c_str());
+    CreatedObject->GetScript().Invoke();
+
+    RealtimeEngine->ProcessPendingEntityOperations();
+
+    const bool ScriptHasErrors = CreatedObject->GetScript().HasError();
+    EXPECT_FALSE(ScriptHasErrors);
+
+    EXPECT_EQ(VideoPlayerComponent->GetPosition(), csp::common::Vector3::One());
+    EXPECT_EQ(VideoPlayerComponent->GetScale(), csp::common::Vector3(2, 2, 2));
+    EXPECT_EQ(VideoPlayerComponent->GetRotation(), csp::common::Vector4::One());
+    EXPECT_EQ(VideoPlayerComponent->GetVideoAssetId(), "TestVideoAssetId");
+    EXPECT_EQ(VideoPlayerComponent->GetVideoAssetURL(), "http://youtube.com/avideo");
+    EXPECT_EQ(VideoPlayerComponent->GetAssetCollectionId(), "TestAssetCollectionId");
+    EXPECT_EQ(VideoPlayerComponent->GetIsStateShared(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsLoopPlayback(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsAutoResize(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetPlaybackState(), VideoPlayerPlaybackState::Play);
+    EXPECT_EQ(VideoPlayerComponent->GetCurrentPlayheadPosition(), 1.0f);
+    EXPECT_EQ(VideoPlayerComponent->GetTimeSincePlay(), 1.f);
+    EXPECT_EQ(VideoPlayerComponent->GetVideoPlayerSourceType(), VideoPlayerSourceType::URLSource);
+    EXPECT_EQ(VideoPlayerComponent->GetStereoVideoType(), StereoVideoType::SideBySide);
+    EXPECT_EQ(VideoPlayerComponent->GetIsStereoFlipped(), true);
+    EXPECT_EQ(VideoPlayerComponent->GetIsVisible(), false);
+    EXPECT_EQ(VideoPlayerComponent->GetIsARVisible(), false);
+    EXPECT_EQ(VideoPlayerComponent->GetIsVirtualVisible(), false);
+    EXPECT_EQ(VideoPlayerComponent->GetIsEnabled(), false);
+
+    auto [ExitSpaceResult] = AWAIT_PRE(SpaceSystem, ExitSpace, RequestPredicate);
+
+    // Delete space
+    DeleteSpace(SpaceSystem, Space.Id);
+
+    // Log out
+    LogOut(UserSystem);
+}

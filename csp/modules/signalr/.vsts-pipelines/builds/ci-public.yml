@@ -1,0 +1,12 @@
+trigger:
+- main
+- release/*
+- vsts/*
+
+jobs:
+- template: ../templates/signalr-build.yml
+  parameters:
+    pool: public
+    variables:
+      Codeql.SkipTaskAutoInjection: true
+      SkipCodeSign: true

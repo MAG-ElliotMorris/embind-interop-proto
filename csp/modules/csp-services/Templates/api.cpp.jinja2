@@ -1,0 +1,90 @@
+{% from 'helpers.jinja2' import print_type, print_method_name, print_method_parameters %}
+
+#include "Common/Web/HttpPayload.h"
+#include "Common/Web/HttpAuth.h"
+#include "CSP/CSPFoundation.h"
+
+#include "Api.h"
+
+#include <string>
+#include <fmt/format.h>
+
+
+namespace csp::services::generated::{{ service_name | lower }} {
+
+{% for tag, routes in tags.items() %}
+    {{ tag }}Api::{{ tag }}Api(csp::web::WebClient* InWebClient) : I{{ tag }}ApiBase(InWebClient)
+    {
+
+    }
+
+    {{ tag }}Api::~{{ tag }}Api()
+    {
+
+    }
+
+    {% for route_path, route in routes.items() %}
+        {% for method_name, method in route.items() %}
+            {# Converts a file path to a camelCase function name with version information removed. #}
+            void {{ tag }}Api::{{ print_method_name(route_path, method_name) }}(
+                [[maybe_unused]] const {{ print_method_name(route_path, method_name) }}Params& Params,
+                csp::services::ApiResponseHandlerBase* ResponseHandler,
+                csp::common::CancellationToken& CancellationToken
+            ) const
+            {
+                csp::web::Uri Uri;
+                Uri.SetWithParams(
+                    {#- Check if the path contains version information in the format 'api/v{version}'. -#}
+                    {%- if route_path[:6] == '/api/v' -%} 
+                        {# Builds the versioned RESTful URL by combining base URI, API version, and a cleaned route path. #}
+                        fmt::format("{0}/api/v{1}{2}", ServiceDefinition.GetURI().c_str(), ServiceDefinition.GetVersion(), "{{ route_path[7:] }}").c_str()
+                    {%- else -%} 
+                        {# Builds the root RESTful URL by appending the route path to the service base URI. #}
+                        fmt::format("{0}{1}", ServiceDefinition.GetURI().c_str(), "{{ route_path }}").c_str()
+                    {%- endif -%},
+                    {
+                        {%- for parameter in method.parameters | selectattr('in', 'equalto', 'path') -%}
+                            {%- if parameter.schema.type == 'string' -%}
+                                Params.{{ parameter.name | identifier }}
+                            {%- else -%}
+                                std::to_string(Params.{{ parameter.name | identifier }}).c_str()
+                            {%- endif -%}{{ ',' if not loop.last }}
+                        {%- endfor -%}
+                    }
+                );
+
+                {% for parameter in method.parameters | selectattr('in', 'equalto', 'query') -%}
+                    {% if 'required' in parameter and parameter.required %}
+                        Uri.AddQueryParams("{{ parameter.name }}", Params.{{ parameter.name | identifier }});
+                    {% else %}
+                        if (Params.{{ parameter.name | identifier }}.has_value())
+                        {
+                            Uri.AddQueryParams("{{ parameter.name }}", Params.{{ parameter.name | identifier }}.value());
+                        }
+                    {% endif %}
+                {% endfor -%}
+
+                csp::web::HttpPayload Payload;
+                Payload.AddHeader(CSP_TEXT("Content-Type"), CSP_TEXT("application/json"));
+
+                {%- if 'requestBody' in method %}
+                    {%- if 'multipart/form-data' in method.requestBody.content -%}
+                        {%- for property_name in method.requestBody.content['multipart/form-data'].schema.properties -%}
+                            Payload.AddFormParam("{{ property_name }}", Params.{{ property_name | pascalcase }});
+                        {%- endfor -%}
+                    {%- else -%}
+                        Payload.AddContent(csp::web::TypeToJsonString(Params.RequestBody));
+                    {%- endif -%}
+                {%- endif %}
+
+                {%- if { 'Bearer': [] } in method.security %}
+                    Payload.SetBearerToken();
+                {%- endif %}
+
+                WebClient->SendRequest(csp::web::ERequestVerb::{{ method_name | upper }}, Uri, Payload, ResponseHandler, CancellationToken);
+            }
+        {% endfor %}
+    {% endfor %}
+{% endfor %}
+
+} // namespace csp::services::generated::{{serviceNameLower}}

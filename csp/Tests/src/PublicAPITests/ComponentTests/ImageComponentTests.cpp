@@ -1,0 +1,259 @@
+/*
+ * Copyright 2023 Magnopus LLC
+
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "../AssetSystemTestHelpers.h"
+#include "../SpaceSystemTestHelpers.h"
+#include "../UserSystemTestHelpers.h"
+#include "Awaitable.h"
+#include "CSP/CSPFoundation.h"
+#include "CSP/Common/Optional.h"
+#include "CSP/Multiplayer/Components/ImageSpaceComponent.h"
+#include "CSP/Multiplayer/Components/ScriptSpaceComponent.h"
+#include "CSP/Multiplayer/MultiPlayerConnection.h"
+#include "CSP/Multiplayer/Script/EntityScript.h"
+#include "CSP/Multiplayer/SpaceEntity.h"
+#include "CSP/Systems/SystemsManager.h"
+#include "CSP/Systems/Users/UserSystem.h"
+#include "TestHelpers.h"
+
+#include "gtest/gtest.h"
+#include <chrono>
+#include <filesystem>
+#include <thread>
+
+using namespace csp::multiplayer;
+using namespace std::chrono_literals;
+
+namespace
+{
+
+bool RequestPredicate(const csp::systems::ResultBase& Result) { return Result.GetResultCode() != csp::systems::EResultCode::InProgress; }
+
+} // namespace
+
+CSP_PUBLIC_TEST(CSPEngine, ImageTests, ImageComponentTest)
+{
+    SetRandSeed();
+
+    auto& SystemsManager = csp::systems::SystemsManager::Get();
+    auto* UserSystem = SystemsManager.GetUserSystem();
+    auto* SpaceSystem = SystemsManager.GetSpaceSystem();
+    auto* AssetSystem = SystemsManager.GetAssetSystem();
+
+    const char* TestAssetCollectionName = "CSP-UNITTEST-ASSETCOLLECTION-MAG";
+    const char* TestAssetName = "CSP-UNITTEST-ASSET-MAG";
+
+    // Log in
+    csp::common::String UserId;
+    LogInAsNewTestUser(UserSystem, UserId);
+
+    // Create space
+    csp::systems::Space Space;
+    CreateDefaultTestSpace(SpaceSystem, Space);
+
+    std::unique_ptr<csp::multiplayer::OnlineRealtimeEngine> RealtimeEngine { SystemsManager.MakeOnlineRealtimeEngine() };
+    RealtimeEngine->SetEntityFetchCompleteCallback([](uint32_t) {});
+
+    auto [EnterResult] = AWAIT_PRE(SpaceSystem, EnterSpace, RequestPredicate, Space.Id, RealtimeEngine.get());
+
+    EXPECT_EQ(EnterResult.GetResultCode(), csp::systems::EResultCode::Success);
+
+    RealtimeEngine->SetRemoteEntityCreatedCallback([](csp::multiplayer::SpaceEntity* /*Entity*/) {});
+
+    csp::common::String CallbackAssetId;
+
+    const csp::common::String ObjectName = "Object 1";
+    SpaceTransform ObjectTransform = { csp::common::Vector3::Zero(), csp::common::Vector4::Zero(), csp::common::Vector3::One() };
+
+    auto [Object] = AWAIT(RealtimeEngine.get(), CreateEntity, ObjectName, ObjectTransform, csp::common::Optional<uint64_t> {});
+
+    const csp::common::String ModelAssetId = "NotARealId";
+
+    auto* ImageSpaceComponentInstance = (ImageSpaceComponent*)Object->AddComponent(ComponentType::Image);
+
+    // Process component creation
+    Object->QueueUpdate();
+    RealtimeEngine->ProcessPendingEntityOperations();
+
+    // Check component was created
+    auto& Components = *Object->GetComponents();
+    EXPECT_EQ(Components.Size(), 1);
+
+    char UniqueAssetCollectionName[256];
+    SPRINTF(UniqueAssetCollectionName, "%s-%s", TestAssetCollectionName, GetUniqueString().c_str());
+
+    char UniqueAssetName[256];
+    SPRINTF(UniqueAssetName, "%s-%s", TestAssetName, GetUniqueString().c_str());
+
+    // Create asset collection
+    csp::systems::AssetCollection AssetCollection;
+    CreateAssetCollection(AssetSystem, Space.Id, nullptr, UniqueAssetCollectionName, nullptr, nullptr, AssetCollection);
+
+    // Create asset
+    csp::systems::Asset Asset;
+    CreateAsset(AssetSystem, AssetCollection, UniqueAssetName, nullptr, nullptr, Asset);
+    Asset.FileName = "OKO.png";
+    Asset.Name = "OKO";
+    Asset.Type = csp::systems::EAssetType::IMAGE;
+
+    auto UploadFilePath = std::filesystem::absolute("assets/OKO.png");
+    FILE* UploadFile = fopen(UploadFilePath.string().c_str(), "rb");
+    uintmax_t UploadFileSize = std::filesystem::file_size(UploadFilePath);
+    auto* UploadFileData = new unsigned char[UploadFileSize];
+    fread(UploadFileData, UploadFileSize, 1, UploadFile);
+    fclose(UploadFile);
+
+    csp::systems::BufferAssetDataSource BufferSource;
+    BufferSource.Buffer = UploadFileData;
+    BufferSource.BufferLength = UploadFileSize;
+
+    BufferSource.SetMimeType("image/png");
+
+    printf("Uploading asset data...\n");
+
+    // Upload data
+    UploadAssetData(AssetSystem, AssetCollection, Asset, BufferSource, Asset.Uri);
+
+    delete[] UploadFileData;
+
+    EXPECT_EQ(ImageSpaceComponentInstance->GetBillboardMode(), BillboardMode::Off);
+    EXPECT_EQ(ImageSpaceComponentInstance->GetDisplayMode(), DisplayMode::DoubleSided);
+    EXPECT_EQ(ImageSpaceComponentInstance->GetIsARVisible(), true);
+    EXPECT_EQ(ImageSpaceComponentInstance->GetIsVirtualVisible(), true);
+    EXPECT_EQ(ImageSpaceComponentInstance->GetIsEmissive(), false);
+
+    ImageSpaceComponentInstance->SetAssetCollectionId(Asset.AssetCollectionId);
+    ImageSpaceComponentInstance->SetImageAssetId(Asset.Id);
+    ImageSpaceComponentInstance->SetBillboardMode(BillboardMode::YawLockedBillboard);
+    ImageSpaceComponentInstance->SetDisplayMode(DisplayMode::SingleSided);
+    ImageSpaceComponentInstance->SetIsARVisible(false);
+    ImageSpaceComponentInstance->SetIsVirtualVisible(false);
+    ImageSpaceComponentInstance->SetIsEmissive(true);
+
+    auto ImageSpaceComponentKey = ImageSpaceComponentInstance->GetId();
+    auto* StoredImageSpaceComponent = (ImageSpaceComponent*)Object->GetComponent(ImageSpaceComponentKey);
+
+    EXPECT_EQ(StoredImageSpaceComponent->GetAssetCollectionId(), Asset.AssetCollectionId);
+    EXPECT_EQ(StoredImageSpaceComponent->GetImageAssetId(), Asset.Id);
+    EXPECT_EQ(StoredImageSpaceComponent->GetBillboardMode(), BillboardMode::YawLockedBillboard);
+    EXPECT_EQ(StoredImageSpaceComponent->GetDisplayMode(), DisplayMode::SingleSided);
+    EXPECT_EQ(StoredImageSpaceComponent->GetIsARVisible(), false);
+    EXPECT_EQ(StoredImageSpaceComponent->GetIsVirtualVisible(), false);
+    EXPECT_EQ(StoredImageSpaceComponent->GetIsEmissive(), true);
+
+    auto [ExitSpaceResult] = AWAIT_PRE(SpaceSystem, ExitSpace, RequestPredicate);
+
+    // Delete space
+    DeleteSpace(SpaceSystem, Space.Id);
+
+    // Log out
+    LogOut(UserSystem);
+}
+
+CSP_PUBLIC_TEST(CSPEngine, ImageTests, ImageScriptInterfaceTest)
+{
+    SetRandSeed();
+
+    auto& SystemsManager = csp::systems::SystemsManager::Get();
+    auto* UserSystem = SystemsManager.GetUserSystem();
+    auto* SpaceSystem = SystemsManager.GetSpaceSystem();
+
+    // Log in
+    csp::common::String UserId;
+    LogInAsNewTestUser(UserSystem, UserId);
+
+    // Create space
+    csp::systems::Space Space;
+    CreateDefaultTestSpace(SpaceSystem, Space);
+
+    std::unique_ptr<csp::multiplayer::OnlineRealtimeEngine> RealtimeEngine { SystemsManager.MakeOnlineRealtimeEngine() };
+    RealtimeEngine->SetEntityFetchCompleteCallback([](uint32_t) {});
+
+    auto [EnterResult] = AWAIT_PRE(SpaceSystem, EnterSpace, RequestPredicate, Space.Id, RealtimeEngine.get());
+
+    EXPECT_EQ(EnterResult.GetResultCode(), csp::systems::EResultCode::Success);
+
+    RealtimeEngine->SetRemoteEntityCreatedCallback([](csp::multiplayer::SpaceEntity* /*Entity*/) {});
+
+    // Create object to represent the image
+    csp::common::String ObjectName = "Object 1";
+    SpaceTransform ObjectTransform = { csp::common::Vector3::Zero(), csp::common::Vector4::Zero(), csp::common::Vector3::One() };
+    auto [CreatedObject] = AWAIT(RealtimeEngine.get(), CreateEntity, ObjectName, ObjectTransform, csp::common::Optional<uint64_t> {});
+
+    // Create image component
+    auto* ImageComponent = (ImageSpaceComponent*)CreatedObject->AddComponent(ComponentType::Image);
+    // Create script component
+    auto* ScriptComponent = (ScriptSpaceComponent*)CreatedObject->AddComponent(ComponentType::ScriptData);
+
+    CreatedObject->QueueUpdate();
+    RealtimeEngine->ProcessPendingEntityOperations();
+
+    EXPECT_EQ(ImageComponent->GetName(), "");
+    EXPECT_EQ(ImageComponent->GetImageAssetId(), "");
+    EXPECT_EQ(ImageComponent->GetPosition(), csp::common::Vector3::Zero());
+    EXPECT_EQ(ImageComponent->GetScale(), csp::common::Vector3::One());
+    EXPECT_EQ(ImageComponent->GetRotation(), csp::common::Vector4::Identity());
+    EXPECT_EQ(ImageComponent->GetBillboardMode(), BillboardMode::Off);
+    EXPECT_EQ(ImageComponent->GetDisplayMode(), DisplayMode::DoubleSided);
+    EXPECT_EQ(ImageComponent->GetIsEmissive(), false);
+    EXPECT_EQ(ImageComponent->GetIsVisible(), true);
+    EXPECT_EQ(ImageComponent->GetIsARVisible(), true);
+    EXPECT_EQ(ImageComponent->GetIsVirtualVisible(), true);
+
+    // Setup script
+    const std::string ImageScriptText = R"xx(
+		var image = ThisEntity.getImageComponents()[0];
+        image.name = "TestName";
+        image.imageAssetId = "TestImageAssetId";
+        image.position = [1, 1, 1];
+        image.scale = [2, 2, 2];
+		image.rotation = [1, 1, 1, 1];
+		image.billboardMode = 1;
+        image.displayMode = 2;
+		image.isEmissive = true;
+        image.isVisible = false;
+        image.isARVisible = false;
+        image.isVirtualVisible = false;
+    )xx";
+
+    ScriptComponent->SetScriptSource(ImageScriptText.c_str());
+    CreatedObject->GetScript().Invoke();
+
+    RealtimeEngine->ProcessPendingEntityOperations();
+
+    const bool ScriptHasErrors = CreatedObject->GetScript().HasError();
+    EXPECT_FALSE(ScriptHasErrors);
+
+    EXPECT_EQ(ImageComponent->GetName(), "TestName");
+    EXPECT_EQ(ImageComponent->GetImageAssetId(), "TestImageAssetId");
+    EXPECT_EQ(ImageComponent->GetPosition(), csp::common::Vector3::One());
+    EXPECT_EQ(ImageComponent->GetScale(), csp::common::Vector3(2, 2, 2));
+    EXPECT_EQ(ImageComponent->GetRotation(), csp::common::Vector4::One());
+    EXPECT_EQ(ImageComponent->GetBillboardMode(), BillboardMode::Billboard);
+    EXPECT_EQ(ImageComponent->GetDisplayMode(), DisplayMode::DoubleSidedReversed);
+    EXPECT_EQ(ImageComponent->GetIsEmissive(), true);
+    EXPECT_EQ(ImageComponent->GetIsVisible(), false);
+    EXPECT_EQ(ImageComponent->GetIsARVisible(), false);
+    EXPECT_EQ(ImageComponent->GetIsVirtualVisible(), false);
+
+    auto [ExitSpaceResult] = AWAIT_PRE(SpaceSystem, ExitSpace, RequestPredicate);
+
+    // Delete space
+    DeleteSpace(SpaceSystem, Space.Id);
+
+    // Log out
+    LogOut(UserSystem);
+}

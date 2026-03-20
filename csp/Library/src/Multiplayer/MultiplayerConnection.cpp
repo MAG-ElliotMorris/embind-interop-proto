@@ -1,0 +1,667 @@
+/*
+ * Copyright 2023 Magnopus LLC
+
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "CSP/Multiplayer/MultiPlayerConnection.h"
+
+#include "CSP/CSPFoundation.h"
+#include "CSP/Common/CSPAsyncScheduler.h"
+#include "CSP/Common/Interfaces/IAuthContext.h"
+#include "CSP/Common/ReplicatedValue.h"
+#include "CSP/Common/fmt_Formatters.h"
+#include "CSP/Multiplayer/ContinuationUtils.h"
+#include "CSP/Multiplayer/NetworkEventBus.h"
+#include "CSP/Multiplayer/OnlineRealtimeEngine.h"
+#include "CSP/Multiplayer/SpaceEntity.h"
+#include "CallHelpers.h"
+#include "Events/EventSystem.h"
+#include "Multiplayer/MultiplayerConstants.h"
+#include "Multiplayer/NetworkEventSerialisation.h"
+#include "Multiplayer/SignalR/ISignalRConnection.h"
+#include "Multiplayer/SignalR/SignalRClient.h"
+#include "Multiplayer/SignalR/SignalRConnection.h"
+#include "NetworkEventManagerImpl.h"
+
+#ifdef CSP_WASM
+#include "Multiplayer/SignalR/EmscriptenSignalRClient/EmscriptenSignalRClient.h"
+#else
+#include "Multiplayer/SignalR/POCOSignalRClient/POCOSignalRClient.h"
+#endif
+
+#include "Common/Web/Uri.h"
+#include "Debug/Logging.h"
+
+#include <algorithm>
+#include <chrono>
+#include <fmt/format.h>
+#include <future>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <thread>
+
+using namespace std::chrono_literals;
+
+namespace csp::multiplayer
+{
+
+static std::map<std::string, ErrorCode> ErrorCodeMap = { { "Scopes_ConcurrentUsersQuota", ErrorCode::SpaceUserLimitExceeded } };
+
+// First - The parsed error code (always ConcurrentUsersQuota or unknown ...), Second - the full error message.
+std::pair<ErrorCode, std::string> MultiplayerConnection::ParseMultiplayerErrorFromExceptionPtr(std::exception_ptr Exception)
+{
+    try
+    {
+        if (Exception)
+        {
+            rethrow_exception(Exception);
+        }
+        else
+        {
+            return { ErrorCode::Unknown, "MultiplayerConnection::ParseMultiplayerErrorFromExceptionPtr, Unexpectedly no exception was thrown." };
+        }
+    }
+    catch (const std::exception& e)
+    {
+        return ParseMultiplayerError(e);
+    }
+}
+
+std::pair<ErrorCode, std::string> MultiplayerConnection::ParseMultiplayerError(const std::exception& Exception)
+{
+    /* E.M: This is a strange function
+     * Whilst it does make sense to parse the errors that come out of the SignalR interaction,
+     * this function is concerned with only the Scopes_ConcurrentUsersQuota error,
+     * (an error that may not even be fired anymore, since it's an unspecified CHS behaviour).
+     * We should either make this parse meaningful, or remove it entirely imo.
+     */
+
+    const std::string ErrorMessage = Exception.what();
+
+    constexpr const char* ERROR_CODE_KEY = "error code:";
+    constexpr size_t ERROR_CODE_KEY_LENGTH = std::char_traits<char>::length(ERROR_CODE_KEY);
+
+    auto Index = ErrorMessage.find(ERROR_CODE_KEY);
+
+    if (Index == std::string::npos)
+    {
+        return { ErrorCode::Unknown, ErrorMessage };
+    }
+
+    Index += ERROR_CODE_KEY_LENGTH;
+
+    // Trim whitespace on left
+    while (isspace(ErrorMessage[Index]))
+    {
+        ++Index;
+    }
+
+    auto StartIndex = Index;
+
+    Index = ErrorMessage.find(',', Index);
+
+    if (Index == std::string::npos)
+    {
+        Index = ErrorMessage.length();
+    }
+
+    auto ErrorCodeString = ErrorMessage.substr(StartIndex, Index - StartIndex);
+
+    if (ErrorCodeMap.count(ErrorCodeString))
+    {
+        return { ErrorCodeMap[ErrorCodeString], ErrorMessage };
+    }
+
+    return { ErrorCode::Unknown, ErrorMessage };
+}
+
+namespace
+{
+
+    constexpr const uint64_t ALL_ENTITIES_ID = std::numeric_limits<uint64_t>::max();
+    constexpr const uint32_t KEEP_ALIVE_INTERVAL = 15;
+}
+
+ISignalRConnection* MultiplayerConnection::MakeSignalRConnection(csp::common::IAuthContext& AuthContext)
+{
+    return new csp::multiplayer::SignalRConnection(csp::CSPFoundation::GetEndpoints().MultiplayerConnection.GetURI().c_str(), KEEP_ALIVE_INTERVAL,
+        std::make_shared<csp::multiplayer::CSPWebsocketClient>(), AuthContext);
+}
+
+MultiplayerConnection::MultiplayerConnection(csp::common::LogSystem& LogSystem, csp::multiplayer::ISignalRConnection& Connection)
+    : Connection(&Connection)
+    , WebSocketClient(nullptr)
+    , NetworkEventManager(new NetworkEventManagerImpl(this))
+    , LogSystem(LogSystem)
+    , ClientId(0)
+    , Connected(false)
+    , MultiplayerHubMethods(MultiplayerHubMethodMap())
+{
+    EventBus = new NetworkEventBus(this, LogSystem);
+}
+
+MultiplayerConnection::~MultiplayerConnection()
+{
+    if (Connection != nullptr)
+    {
+        if (Connected)
+        {
+            std::promise<ErrorCode> shutdownPromise;
+
+            DisconnectWithReason(
+                "MultiplayerConnection shutting down.", [&shutdownPromise](ErrorCode errorCode) { shutdownPromise.set_value(errorCode); });
+
+            auto shutdownFuture = shutdownPromise.get_future();
+            shutdownFuture.wait();
+        }
+
+        delete (Connection);
+        delete (WebSocketClient);
+        delete (NetworkEventManager);
+        delete (EventBus);
+    }
+}
+
+void MultiplayerConnection::SetOnlineRealtimeEngine(csp::multiplayer::OnlineRealtimeEngine* OnlineRealtimeEngine)
+{
+    MultiplayerRealtimeEngine = OnlineRealtimeEngine;
+}
+
+csp::multiplayer::OnlineRealtimeEngine* MultiplayerConnection::GetOnlineRealtimeEngine() const { return MultiplayerRealtimeEngine; }
+
+void MultiplayerConnection::__CauseFailure() { WebSocketClient->__CauseFailure(); }
+
+MultiplayerConnection::MultiplayerConnection(const MultiplayerConnection& InBoundConnection)
+    : LogSystem(InBoundConnection.LogSystem)
+{
+    Connection = InBoundConnection.Connection;
+    WebSocketClient = InBoundConnection.WebSocketClient;
+    NetworkEventManager = InBoundConnection.NetworkEventManager;
+    ClientId = InBoundConnection.ClientId;
+    DisconnectionCallback = InBoundConnection.DisconnectionCallback;
+    ConnectionCallback = InBoundConnection.ConnectionCallback;
+    NetworkInterruptionCallback = InBoundConnection.NetworkInterruptionCallback;
+    EventBus = InBoundConnection.EventBus;
+    Connected = (InBoundConnection.Connected) ? true : false;
+}
+
+namespace
+{
+    void RegisterNetworkInterruptedCallback(csp::multiplayer::ISignalRConnection* Connection, csp::common::LogSystem& LogSystem,
+        const MultiplayerConnection::NetworkInterruptionCallbackHandler& NetworkInterruptionCallback)
+    {
+        Connection->SetDisconnected(
+            [&NetworkInterruptionCallback, &LogSystem](const std::exception_ptr& Except)
+            {
+                // We currently detect a connection interrupt if the disconnected callback contains an exception.
+                if (Except)
+                {
+                    try
+                    {
+                        std::rethrow_exception(Except);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        INVOKE_IF_NOT_NULL(NetworkInterruptionCallback, e.what());
+                        LogSystem.LogMsg(csp::common::LogLevel::Log, "Connection Interrupted.");
+                    }
+                }
+            });
+    }
+}
+
+auto MultiplayerConnection::DeleteEntities(uint64_t EntityId) const
+{
+    return [this, EntityId]()
+    {
+        // Shared pointer to keep alive in local callback
+        auto EntitiesDeletedEvent = std::make_shared<async::event_task<void>>();
+        auto EntitiesDeletedContinuation = EntitiesDeletedEvent->get_task();
+        if (!Connected)
+        {
+            throw csp::common::continuations::ErrorCodeException(
+                ErrorCode::NotConnected, "MultiplayerConnection::DeleteEntities, Error not connected.");
+        }
+        std::function<void(signalr::value, std::exception_ptr)> LocalCallback
+            = [EntitiesDeletedEvent](signalr::value /*Result*/, std::exception_ptr Except)
+        {
+            if (Except != nullptr)
+            {
+                auto [Error, ExceptionErrorMsg] = ParseMultiplayerErrorFromExceptionPtr(Except);
+                EntitiesDeletedEvent->set_exception(std::make_exception_ptr(csp::common::continuations::ErrorCodeException(
+                    Error, "MultiplayerConnection::DeleteEntities, Unexpected error response from SignalR \"DeleteObjects\" invocation.")));
+                return;
+            }
+
+            EntitiesDeletedEvent->set();
+        };
+
+        std::vector<signalr::value> ParamsVec;
+
+        if (EntityId == ALL_ENTITIES_ID)
+        {
+            ParamsVec.push_back(signalr::value_type::null);
+        }
+        else
+        {
+            std::vector<signalr::value> EntityIDs;
+            EntityIDs.push_back(signalr::value(EntityId));
+            ParamsVec.push_back(EntityIDs);
+        }
+
+        signalr::value DeleteEntityMessage = signalr::value(std::move(ParamsVec));
+
+        LogSystem.LogMsg(csp::common::LogLevel::Verbose, "Calling DeleteObjects");
+
+        Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::DELETE_OBJECTS), DeleteEntityMessage, LocalCallback);
+
+        return EntitiesDeletedContinuation;
+    };
+}
+
+/*
+   Requests the connected Client ID from CHS.
+ */
+auto MultiplayerConnection::RequestClientId()
+{
+    return [this]()
+    {
+        // Shared pointer to keep alive in local callback
+        auto ClientIdRequestedEvent = std::make_shared<async::event_task<uint64_t>>();
+        auto ClientIdRequestedContinuation = ClientIdRequestedEvent->get_task();
+
+        if (!Connected)
+        {
+            throw csp::common::continuations::ErrorCodeException(
+                ErrorCode::NotConnected, "MultiplayerConnection::RequestClientId, Error not connected.");
+        }
+
+        std::function<void(signalr::value, std::exception_ptr)> LocalCallback
+            = [ClientIdRequestedEvent, this](signalr::value Result, std::exception_ptr Except)
+        {
+            if (Except != nullptr)
+            {
+                auto [Error, ExceptionErrorMsg] = ParseMultiplayerErrorFromExceptionPtr(Except);
+                ClientIdRequestedEvent->set_exception(std::make_exception_ptr(csp::common::continuations::ErrorCodeException(
+                    Error, "MultiplayerConnection::RequestClientId, Error when starting requesting Client Id.")));
+                return;
+            }
+
+            LogSystem.LogMsg(csp::common::LogLevel::Verbose, fmt::format("ClientId={}", Result.as_uinteger()).c_str());
+
+            ClientIdRequestedEvent->set(Result.as_uinteger());
+        };
+
+        LogSystem.LogMsg(csp::common::LogLevel::Verbose, "Calling GetClientId");
+
+        Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::GET_CLIENT_ID), signalr::value(signalr::value_type::array), LocalCallback);
+        return ClientIdRequestedContinuation;
+    };
+}
+
+async::task<std::tuple<signalr::value, std::exception_ptr>> MultiplayerConnection::StartListening()
+{
+    if (!Connected)
+    {
+        throw csp::common::continuations::ErrorCodeException(ErrorCode::NotConnected, "MultiplayerConnection::StartListening, Error not connected.");
+    }
+
+    LogSystem.LogMsg(csp::common::LogLevel::Verbose, "Calling StartListening");
+    return Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::START_LISTENING), signalr::value(signalr::value_type::array));
+}
+
+void MultiplayerConnection::Connect(ErrorCodeCallbackHandler Callback, [[maybe_unused]] const csp::common::String& MultiplayerUri,
+    const csp::common::String& AccessToken, const csp::common::String& DeviceId)
+{
+    if (Connected)
+    {
+        INVOKE_IF_NOT_NULL(Callback, ErrorCode::AlreadyConnected);
+
+        return;
+    }
+
+// You will notice that the Emscripten webclient doesn't take the Uri into its constructor.
+// This is because it uses the url passed into its Start function, which gets modified by SignalR.
+// This modified version isn't compatible with our POCO implementation, so we need to directly use the MultiplayerUri.
+#ifdef CSP_WASM
+    WebSocketClient = new csp::multiplayer::CSPWebSocketClientEmscripten(AccessToken.c_str(), DeviceId.c_str());
+#else
+    WebSocketClient = new csp::multiplayer::CSPWebSocketClientPOCO(MultiplayerUri.c_str(), AccessToken.c_str(), DeviceId.c_str(), LogSystem);
+#endif
+    csp::multiplayer::SetWebSocketClient(WebSocketClient);
+
+    NetworkEventManager->SetConnection(*Connection);
+
+    BindOnObjectMessage();
+    BindOnObjectPatch();
+    BindOnRequestToSendObject();
+    BindOnRequestToDisconnect();
+    BindOnElectedScopeLeaderCallback();
+    BindOnVacatedScopeLeaderCallback();
+
+    EventBus->StartEventMessageListening();
+
+    // We register the network interruption callback as a wrapper because we want to unwrap any signalR exceptions.
+    RegisterNetworkInterruptedCallback(Connection, LogSystem, NetworkInterruptionCallback);
+
+    /*
+     * Start() - Start the SignalR socket connection
+     * Lambda - Set connected to be true if successful start()
+     * RequestClientId() - Request the client Id
+     * Lambda - and store it
+     * StartListening() - Invoke StartListening on the SignalR socket connection
+     * Lambda - Invoke success callbacks if start listening succeeded
+     * InvokeIfExceptionIsInChain - Handle any errors in the Connect chain
+     */
+
+    Start()
+        .then(async::inline_scheduler(), [this]() { Connected = true; })
+        .then(async::inline_scheduler(), DeleteEntities(ALL_ENTITIES_ID))
+        .then(async::inline_scheduler(), RequestClientId())
+        .then(async::inline_scheduler(), [this](uint64_t RetrievedClientId) { ClientId = RetrievedClientId; })
+        .then(async::inline_scheduler(), [this]() { return StartListening(); })
+        .then(multiplayer::continuations::UnwrapSignalRResultOrThrow<false>())
+        .then(async::inline_scheduler(),
+            [this, Callback]()
+            {
+                // Success
+                INVOKE_IF_NOT_NULL(ConnectionCallback, "Successfully connected to SignalR hub.");
+                INVOKE_IF_NOT_NULL(Callback, ErrorCode::None);
+            })
+        .then(async::inline_scheduler(),
+            csp::common::continuations::InvokeIfExceptionInChain(LogSystem,
+                // Handle any errors in chain
+                [Callback, this]([[maybe_unused]] const csp::common::continuations::ExpectedExceptionBase& exception)
+                {
+                    auto [Error, ExceptionErrorMsg] = ParseMultiplayerError(exception);
+                    DisconnectWithReason(ExceptionErrorMsg.c_str(), Callback);
+                }));
+}
+
+void MultiplayerConnection::Disconnect(ErrorCodeCallbackHandler Callback)
+{
+    if (!Connected)
+    {
+        INVOKE_IF_NOT_NULL(Callback, ErrorCode::NotConnected);
+
+        return;
+    }
+
+    DisconnectWithReason("Client called disconnect.", Callback);
+}
+
+void MultiplayerConnection::DisconnectWithReason(const csp::common::String& Reason, ErrorCodeCallbackHandler Callback)
+{
+    const ExceptionCallbackHandler StopHandler = [this, Callback, Reason](const std::exception_ptr& Except)
+    {
+        ErrorCode Error = ErrorCode::None;
+        if (Except != nullptr)
+        {
+            auto [ExceptionError, ExceptionErrorMsg] = ParseMultiplayerErrorFromExceptionPtr(Except);
+            Error = ExceptionError;
+        }
+
+        Connected = false;
+        INVOKE_IF_NOT_NULL(Callback, Error);
+        INVOKE_IF_NOT_NULL(DisconnectionCallback, Reason);
+    };
+
+    Stop(StopHandler);
+}
+
+void MultiplayerConnection::Start(const ExceptionCallbackHandler Callback) const { Connection->Start(Callback); }
+
+async::task<void> MultiplayerConnection::Start() const
+{
+    // Shared pointer to keep alive in local callback
+    auto OnCompleteEvent = std::make_shared<async::event_task<void>>();
+    async::task<void> OnCompleteTask = OnCompleteEvent->get_task();
+
+    Connection->Start(
+        [OnCompleteEvent](std::exception_ptr exception)
+        {
+            if (exception)
+            {
+                auto [Error, ExceptionErrorMsg] = ParseMultiplayerErrorFromExceptionPtr(exception);
+                OnCompleteEvent->set_exception(std::make_exception_ptr(
+                    csp::common::continuations::ErrorCodeException(Error, "MultiplayerConnection::Start, Error when starting SignalR connection.")));
+                return;
+            }
+
+            OnCompleteEvent->set();
+        });
+
+    return OnCompleteTask;
+}
+
+void MultiplayerConnection::Stop(const ExceptionCallbackHandler Callback) const
+{
+    if (!Connected)
+    {
+        INVOKE_IF_NOT_NULL(
+            Callback, std::make_exception_ptr(csp::common::continuations::ErrorCodeException(ErrorCode::NotConnected, "No Connection!")));
+        return;
+    }
+
+    Connection->Stop(Callback);
+}
+
+void MultiplayerConnection::SetDisconnectionCallback(DisconnectionCallbackHandler Callback) { DisconnectionCallback = Callback; }
+
+void MultiplayerConnection::SetConnectionCallback(ConnectionCallbackHandler Callback) { ConnectionCallback = Callback; }
+
+CSP_EVENT void MultiplayerConnection::SetNetworkInterruptionCallback(NetworkInterruptionCallbackHandler Callback)
+{
+    NetworkInterruptionCallback = Callback;
+}
+
+async::task<std::tuple<signalr::value, std::exception_ptr>> MultiplayerConnection::SetScopes(csp::common::String InSpaceId)
+{
+    if (!Connected)
+    {
+        throw csp::common::continuations::ErrorCodeException(ErrorCode::NotConnected, "MultiplayerConnection::SetScopes, Error not connected.");
+    }
+
+    LogSystem.LogMsg(csp::common::LogLevel::Verbose, "Calling SetScopes");
+
+    std::vector<signalr::value> ScopesVec;
+
+    // Set the scope using the Space Id
+    ScopesVec.push_back(signalr::value(InSpaceId.c_str()));
+
+    std::vector<signalr::value> ParamsVec;
+    ParamsVec.push_back(ScopesVec);
+    signalr::value Params = signalr::value(std::move(ParamsVec));
+
+    return Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::SET_SCOPES), Params);
+}
+
+async::task<std::tuple<signalr::value, std::exception_ptr>> MultiplayerConnection::ResetScopes()
+{
+    if (!Connected)
+    {
+        throw csp::common::continuations::ErrorCodeException(ErrorCode::NotConnected, "MultiplayerConnection::ResetScopes, Error not connected.");
+    }
+
+    std::vector<signalr::value> ParamsVec;
+    signalr::value Params = signalr::value(std::move(ParamsVec));
+    return Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::RESET_SCOPES), Params);
+}
+
+async::task<std::tuple<signalr::value, std::exception_ptr>> MultiplayerConnection::StopListening()
+{
+    if (!Connected)
+    {
+        throw csp::common::continuations::ErrorCodeException(ErrorCode::NotConnected, "MultiplayerConnection::StopListening, Error not connected.");
+    }
+
+    LogSystem.LogMsg(csp::common::LogLevel::Verbose, "Calling StopListening");
+
+    return Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::STOP_LISTENING), signalr::value(signalr::value_type::array));
+}
+
+uint64_t MultiplayerConnection::GetClientId() const { return ClientId; }
+
+ConnectionState MultiplayerConnection::GetConnectionState() const { return static_cast<ConnectionState>(Connection->GetConnectionState()); }
+
+CSP_ASYNC_RESULT void MultiplayerConnection::SetAllowSelfMessagingFlag(const bool InAllowSelfMessaging, ErrorCodeCallbackHandler Callback)
+{
+    if (!Connected)
+    {
+        INVOKE_IF_NOT_NULL(Callback, ErrorCode::NotConnected);
+
+        return;
+    }
+
+    std::function<void(signalr::value, std::exception_ptr)> LocalCallback
+        = [this, Callback, InAllowSelfMessaging](signalr::value /*Result*/, std::exception_ptr Except)
+    {
+        if (Except != nullptr)
+        {
+            auto [Error, ExceptionErrorMsg] = ParseMultiplayerErrorFromExceptionPtr(Except);
+            INVOKE_IF_NOT_NULL(Callback, Error);
+
+            return;
+        }
+
+        AllowSelfMessaging = InAllowSelfMessaging;
+
+        INVOKE_IF_NOT_NULL(Callback, ErrorCode::None);
+    };
+
+    LogSystem.LogMsg(csp::common::LogLevel::Verbose, "Calling SetAllowSelfMessaging");
+
+    const std::vector InvokeArguments = { signalr::value(InAllowSelfMessaging) };
+    Connection->Invoke(MultiplayerHubMethods.Get(MultiplayerHubMethod::SET_ALLOW_SELF_MESSAGING), InvokeArguments, LocalCallback);
+}
+
+bool MultiplayerConnection::GetAllowSelfMessagingFlag() const { return AllowSelfMessaging; }
+
+void MultiplayerConnection::BindOnObjectMessage()
+{
+    const std::string OnObjectMessage = GetMultiplayerHubMethods().Get(MultiplayerHubMethod::ON_OBJECT_MESSAGE);
+    GetSignalRConnection()->On(
+        OnObjectMessage,
+        [this](const signalr::value& Params)
+        {
+            if (MultiplayerRealtimeEngine != nullptr)
+            {
+                MultiplayerRealtimeEngine->OnObjectMessage(Params);
+            }
+            else
+            {
+                LogSystem.LogMsg(
+                    common::LogLevel::Verbose, "Received OnObjectMessage without an alive EntitySystem. This is expected if leaving a space.");
+            }
+        },
+        LogSystem);
+}
+
+void MultiplayerConnection::BindOnObjectPatch()
+{
+    const std::string OnObjectPatch = GetMultiplayerHubMethods().Get(MultiplayerHubMethod::ON_OBJECT_PATCH);
+    GetSignalRConnection()->On(
+        OnObjectPatch,
+        [this](const signalr::value& Params)
+        {
+            if (MultiplayerRealtimeEngine != nullptr)
+            {
+                MultiplayerRealtimeEngine->OnObjectPatch(Params);
+            }
+            else
+            {
+                LogSystem.LogMsg(
+                    common::LogLevel::Verbose, "Received OnObjectPatch without an alive EntitySystem. This is expected if leaving a space.");
+            }
+        },
+        LogSystem);
+}
+
+void MultiplayerConnection::BindOnRequestToSendObject()
+{
+    const std::string OnRequestToSendObject = GetMultiplayerHubMethods().Get(MultiplayerHubMethod::ON_REQUEST_TO_SEND_OBJECT);
+    GetSignalRConnection()->On(
+        OnRequestToSendObject,
+        [this](const signalr::value& Params)
+        {
+            if (MultiplayerRealtimeEngine != nullptr)
+            {
+                MultiplayerRealtimeEngine->OnRequestToSendObject(Params);
+            }
+            else
+            {
+                LogSystem.LogMsg(
+                    common::LogLevel::Verbose, "Received OnRequestToSendObject without an alive EntitySystem. This is expected if leaving a space.");
+            }
+        },
+        LogSystem);
+}
+
+void MultiplayerConnection::BindOnRequestToDisconnect()
+{
+    const std::string OnRequestToDisconnect = GetMultiplayerHubMethods().Get(MultiplayerHubMethod::ON_REQUEST_TO_DISCONNECT);
+    GetSignalRConnection()->On(
+        OnRequestToDisconnect,
+        [&](const signalr::value& Params)
+        {
+            std::promise<bool> Promise;
+            std::future<bool> Future = Promise.get_future();
+
+            const std::string Reason = Params.as_array()[0].as_string();
+            DisconnectWithReason(Reason.c_str(), [&Promise](ErrorCode /*Error*/) { Promise.set_value(true); });
+
+            Future.wait_for(2000ms);
+        },
+        LogSystem);
+}
+
+void MultiplayerConnection::BindOnElectedScopeLeaderCallback()
+{
+    GetSignalRConnection()->On(
+        GetMultiplayerHubMethods().Get(MultiplayerHubMethod::ON_ELECTED_SCOPE_LEADER),
+        [this](signalr::value Params)
+        {
+            if (MultiplayerRealtimeEngine != nullptr)
+            {
+                MultiplayerRealtimeEngine->OnElectedScopeLeader(Params);
+            }
+            else
+            {
+                LogSystem.LogMsg(
+                    common::LogLevel::Verbose, "Received OnElectedScopeLeader without an alive EntitySystem. This is expected if leaving a space.");
+            }
+        },
+        LogSystem);
+}
+
+void MultiplayerConnection::BindOnVacatedScopeLeaderCallback()
+{
+    GetSignalRConnection()->On(
+        GetMultiplayerHubMethods().Get(MultiplayerHubMethod::ON_VACATED_AS_SCOPE_LEADER),
+        [this](signalr::value Params)
+        {
+            if (MultiplayerRealtimeEngine != nullptr)
+            {
+                MultiplayerRealtimeEngine->OnVacatedAsScopeLeader(Params);
+            }
+            else
+            {
+                LogSystem.LogMsg(
+                    common::LogLevel::Verbose, "Received OnVacatedScopeLeader without an alive EntitySystem. This is expected if leaving a space.");
+            }
+        },
+        LogSystem);
+}
+
+} // namespace csp::multiplayer

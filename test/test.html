@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>CSP Embind Smoke Test</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+        .pass { color: #4ec9b0; }
+        .fail { color: #f44747; }
+        .info { color: #569cd6; }
+        pre { margin: 4px 0; }
+    </style>
+</head>
+<body>
+    <h2>CSP Embind Smoke Test</h2>
+    <div id="output"></div>
+
+    <script type="module">
+        const output = document.getElementById('output');
+
+        function log(msg, cls = '') {
+            const el = document.createElement('pre');
+            el.textContent = msg;
+            if (cls) el.className = cls;
+            output.appendChild(el);
+        }
+
+        // SharedArrayBuffer is required for pthreads — check early
+        if (typeof SharedArrayBuffer === 'undefined') {
+            log('ERROR: SharedArrayBuffer is not available.', 'fail');
+            log('The server must send these headers:', 'fail');
+            log('  Cross-Origin-Opener-Policy: same-origin', 'fail');
+            log('  Cross-Origin-Embedder-Policy: require-corp', 'fail');
+            log('', 'fail');
+            log('Start the server with:  python test/serve.py', 'fail');
+            throw new Error('SharedArrayBuffer unavailable');
+        }
+
+        function TestBasicObjectConstruction(CSP) {
+            log('=== Testing Basic Object Construction ===', 'info');
+            using position = new CSP.Vector3(1, 2, 3);
+            using rotation = new CSP.Vector4(90, 180, 90, 1);
+            using scale = new CSP.Vector3(1, 2, 3);
+            using transform = new CSP.SpaceTransform(position, rotation, scale);
+
+            console.assert(position.X === 1);
+            console.assert(position.Y === 2);
+            console.assert(position.Z === 3);
+    
+            console.assert(rotation.X === 90);
+            console.assert(rotation.Y === 180);
+            console.assert(rotation.Z === 90);
+            console.assert(rotation.W === 1);
+
+            console.assert(scale.X === 1);
+            console.assert(scale.Y === 2);
+            console.assert(scale.Z === 3);
+
+            console.assert(transform.Position != position);
+            console.assert(transform.Rotation != rotation);
+            console.assert(transform.Scale != scale);
+
+            console.assert(transform.Position.X === 1);
+            console.assert(transform.Position.Y === 2);
+            console.assert(transform.Position.Z === 3);
+
+           log("Basic Construction Tests Pass!");
+        }
+
+        async function TestCallbacks(CSP) {
+             log('=== Testing Callbacks ===', 'info');
+             using logSystem = new CSP.LogSystem();
+             using scriptRunner = new CSP.NoOpScriptRunner();
+
+             using engine = new CSP.OfflineRealtimeEngine(logSystem, scriptRunner);
+
+             using position = new CSP.Vector3(1, 2, 3);
+             using rotation = new CSP.Vector4(90, 180, 90, 1);
+             using scale = new CSP.Vector3(1, 2, 3);
+             using transform = new CSP.SpaceTransform(position, rotation, scale);
+
+             const entity = await new Promise((resolve, reject) => {
+                 engine.CreateEntity("EntityName", transform, null, (e) => {
+                     if (e) resolve(e); else reject(new Error("Entity creation failed"));
+                 });
+             });
+             console.assert(entity !== null, "entity should not be null");
+
+             const entity2 = await new Promise((resolve, reject) => {
+                 engine.CreateEntity("Entity2", transform, null, (e) => {
+                     if (e) resolve(e); else reject(new Error("Entity creation failed"));
+                 });
+             });
+             console.assert(entity2.GetId() === entity.GetId() + 1n, "entity2 ID should be entity ID + 1");
+
+             log("Callback Tests Pass!");
+        }
+
+        async function TestAsyncAwait(CSP) {
+            log('=== Testing Async/Await ===', 'info');
+            using logSystem = new CSP.LogSystem();
+            using scriptRunner = new CSP.NoOpScriptRunner();
+
+            using engine = new CSP.OfflineRealtimeEngine(logSystem, scriptRunner);
+
+            using position = new CSP.Vector3(1, 2, 3);
+            using rotation = new CSP.Vector4(90, 180, 90, 1);
+            using scale = new CSP.Vector3(1, 2, 3);
+            using transform = new CSP.SpaceTransform(position, rotation, scale);
+
+            const parentID = null;
+
+            await engine.CreateEntityAsync("EntityName", transform, parentID);
+
+            log('Await/Async Tests Pass!')
+
+        }
+
+        async function TestContainers(CSP) {
+            log('=== Testing Containers ===', 'info');
+            using logSystem = new CSP.LogSystem();
+            using scriptRunner = new CSP.NoOpScriptRunner();
+
+            using engine = new CSP.OfflineRealtimeEngine(logSystem, scriptRunner);
+
+            using position = new CSP.Vector3(1, 2, 3);
+            using rotation = new CSP.Vector4(90, 180, 90, 1);
+            using scale = new CSP.Vector3(1, 2, 3);
+            using transform = new CSP.SpaceTransform(position, rotation, scale);
+
+            await engine.CreateEntityAsync("EntityName1", transform, null);
+            await engine.CreateEntityAsync("EntityName2", transform, null);
+
+            const entitiesArray = engine.GetAllEntities();
+            console.assert(entitiesArray.length === 2);
+            console.assert((entitiesArray[0].GetId() + 1n) === entitiesArray[1].GetId());
+
+            log('Container Tests Pass!')
+        }
+
+        async function TestOffThreadCallbacks(CSP)
+        {
+            log('=== Testing Off Thread Callbacks ===', 'info');
+
+            using logSystem = new CSP.LogSystem();
+            using scriptRunner = new CSP.NoOpScriptRunner();
+            using engine = new CSP.OfflineRealtimeEngine(logSystem, scriptRunner);
+
+            const offthreadInt = await new Promise((resolve, reject) => {
+                 engine.SpawnIntOffThreadAfterTime(1.0, (e) => {
+                     if (e) resolve(e); else reject(new Error("Something failed"));
+                 });
+             });
+            
+            console.assert(offthreadInt === 5);
+
+            log('Off Thread Callback Tests Pass!');
+        }
+
+        async function TestExceptions(CSP)
+        {
+            log('=== Testing Native Exceptions ===', 'info');
+
+            using logSystem = new CSP.LogSystem();
+            using scriptRunner = new CSP.NoOpScriptRunner();
+            using engine = new CSP.OfflineRealtimeEngine(logSystem, scriptRunner);
+      
+            using position = new CSP.Vector3(1, 2, 3);
+            using rotation = new CSP.Vector4(90, 180, 90, 1);
+            using scale = new CSP.Vector3(1, 2, 3);
+            using transform = new CSP.SpaceTransform(position, rotation, scale);
+
+            // var sp = CSP.stackSave();
+            try
+            {
+                await engine.CreateEntityAsync("PleaseThrow", transform, null);
+            }
+            catch (e)
+            {
+                // The emscripten docs state we should do this stackrestore thing in JS when handling exceptions, otherwise we leak.
+                // Can't say I fully understand this yet.
+                // https://emscripten.org/docs/porting/exceptions.html#emscripten-javascript-based-exception-support
+                // stackRestore(sp);
+                const msg = CSP.getExceptionMessage(e)
+                log(msg);
+                log('Native Exceptions Tests Pass!');
+                // decrementExceptionRefcount(e);
+
+                // This is all gross, we should just catch natively and convert to something JS dosen't have such trouble dealing with without leaking.
+                // I actually cant be arsed figuring out how to export these functions right now, this leaks I guess.
+            }
+        }
+
+        async function TestJSExceptions(CSP)
+        {
+            log('=== Testing JS Exceptions In callbacks ===', 'info');
+
+             using logSystem = new CSP.LogSystem();
+             using scriptRunner = new CSP.NoOpScriptRunner();
+
+             using engine = new CSP.OfflineRealtimeEngine(logSystem, scriptRunner);
+
+             using position = new CSP.Vector3(1, 2, 3);
+             using rotation = new CSP.Vector4(90, 180, 90, 1);
+             using scale = new CSP.Vector3(1, 2, 3);
+             using transform = new CSP.SpaceTransform(position, rotation, scale);
+
+            try{
+                 engine.CreateEntity("EntityName", transform, null, (e) => {
+                     throw new Error("Oh my god a JS exception!")
+                 });
+            }
+            catch(e)
+            {
+                log(e);
+            }
+        }
+
+
+        try {
+            log('Loading CSP WASM module...', 'info');
+            const createCSPModule = (await import('../build/csp_embind.js')).default;
+            const CSP = await createCSPModule();
+            log('Module loaded.\n', 'info');
+            
+            TestBasicObjectConstruction(CSP);
+            await TestCallbacks(CSP);
+            await TestAsyncAwait(CSP);
+            await TestContainers(CSP)
+            await TestOffThreadCallbacks(CSP);
+            await TestExceptions(CSP);
+            await TestJSExceptions(CSP);
+
+
+        } catch (e) {
+            log(`\nERROR: ${e.message}`, 'fail');
+            log(e.stack, 'fail');
+        }
+    </script>
+</body>
+</html>
